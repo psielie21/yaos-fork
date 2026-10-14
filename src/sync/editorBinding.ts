@@ -31,6 +31,13 @@ const POST_BIND_HEALTH_GRACE_MS = 100;
 const LIVE_UPDATE_HEALTH_RETRY_DELAY_MS = 120;
 const CM_RESOLVE_RETRY_DELAY_MS = 100;
 const CM_RESOLVE_MAX_RETRIES = 8;
+/**
+ * Seeding a brand-new file waits for the editor to show that file's content.
+ * Linear backoff: 100, 200, … 1000ms = 5.5s total, comfortably past the
+ * fast-switch settle window, before unsaved typing is treated as authoritative.
+ */
+const DISK_SEED_RETRY_DELAY_MS = 100;
+const DISK_SEED_MAX_ATTEMPTS = 10;
 
 /** Why a getCmView() call failed to resolve an editor, for degraded traces. */
 interface CmResolveFailure {
@@ -137,6 +144,9 @@ export class EditorBindingManager {
 	private cmDegradedWarned = false;
 	private cmResolveAttempts = new Map<string, number>();
 	private pendingCmResolveRetries = new Map<string, number>();
+	/** Deferred disk-backed seeds for paths with no CRDT entry yet, by leaf. */
+	private pendingDiskSeeds = new Map<string, { path: string; timer: number }>();
+	private diskSeedAttempts = new Map<string, number>();
 	/**
 	 * Why the last getCmView() call returned null. Attached to the degraded
 	 * trace so field reports separate "no editor ever registered" (our CM6
@@ -454,6 +464,9 @@ export class EditorBindingManager {
 	 * Unbind all editors. Called on plugin unload.
 	 */
 	unbindAll(): void {
+		for (const leafId of Array.from(this.pendingDiskSeeds.keys())) {
+			this.clearDiskSeed(leafId);
+		}
 		for (const [leafId, binding] of this.bindings) {
 			this.clearScheduledHealthCheck(leafId);
 			this.clearCmResolveRetry(leafId);
@@ -470,6 +483,9 @@ export class EditorBindingManager {
 	 * Called when a file is deleted (locally or remotely).
 	 */
 	unbindByPath(path: string): void {
+		for (const [leafId, pending] of Array.from(this.pendingDiskSeeds)) {
+			if (pending.path === path) this.clearDiskSeed(leafId);
+		}
 		for (const [leafId, binding] of this.bindings) {
 			if (binding.path === path) {
 				this.clearScheduledHealthCheck(leafId);
@@ -1430,29 +1446,140 @@ export class EditorBindingManager {
 			return null;
 		}
 
-		const currentContent = view.editor.getValue();
-		const ytext = this.vaultSync.ensureFile(file.path, currentContent, deviceName);
-		if (!ytext) {
-			if (this.isHardTombstonedPath(file.path)) {
-				this.handleTombstonedBinding(view, `${reason}:ensureFile-null`);
-			} else {
-				this.log(`resolveBindingTarget: ensureFile returned null for "${file.path}" (reason=${reason})`);
-				this.trace?.("editor", "binding-target-missing", {
-					path: file.path,
-					reason,
-					leafId:
-						view.leaf.id ?? file.path,
-				});
+		// No CRDT entry yet: this is a file the CRDT has never seen, typically a
+		// note just created in this pane. Do NOT seed from the editor here.
+		// Obsidian points `view.file` at the new file before the editor has
+		// loaded its content, so `view.editor.getValue()` can still hold the
+		// previously open note. Seeding from it copied that note into the new
+		// file's CRDT, which then disagreed with disk and minted
+		// "(YAOS conflict - crdt …)" artifacts. Seed asynchronously from disk
+		// once the editor demonstrably shows this file, then bind.
+		const leafId = view.leaf.id ?? file.path;
+		this.scheduleDiskSeed(view, deviceName, leafId, file.path, reason, 0);
+		return null;
+	}
+
+	/**
+	 * Schedule a disk-backed seed for a path with no CRDT entry yet.
+	 * One pending seed per leaf; a newer request for a different path in the
+	 * same leaf replaces the older one.
+	 */
+	private scheduleDiskSeed(
+		view: MarkdownView,
+		deviceName: string,
+		leafId: string,
+		path: string,
+		reason: string,
+		delayMs: number,
+	): void {
+		const pending = this.pendingDiskSeeds.get(leafId);
+		if (pending) {
+			if (pending.path === path && delayMs === 0) return;
+			window.clearTimeout(pending.timer);
+		}
+		if (!pending || pending.path !== path) {
+			this.diskSeedAttempts.set(leafId, 0);
+		}
+		const timer = window.setTimeout(() => {
+			if (this.pendingDiskSeeds.get(leafId)?.timer !== timer) return;
+			void this.seedFromDisk(view, deviceName, leafId, path, reason).then((result) => {
+				if (this.pendingDiskSeeds.get(leafId)?.timer !== timer) return;
+				if (result === "retry") {
+					this.pendingDiskSeeds.delete(leafId);
+					const attempts = this.diskSeedAttempts.get(leafId) ?? 0;
+					this.scheduleDiskSeed(view, deviceName, leafId, path, reason, DISK_SEED_RETRY_DELAY_MS * attempts);
+					return;
+				}
+				this.clearDiskSeed(leafId);
+			});
+		}, delayMs);
+		this.pendingDiskSeeds.set(leafId, { path, timer });
+		this.trace?.("editor", "binding-seed-deferred", { leafId, path, reason, delayMs });
+	}
+
+	private clearDiskSeed(leafId: string): void {
+		const pending = this.pendingDiskSeeds.get(leafId);
+		if (pending) window.clearTimeout(pending.timer);
+		this.pendingDiskSeeds.delete(leafId);
+		this.diskSeedAttempts.delete(leafId);
+	}
+
+	/**
+	 * Create the CRDT entry for `path` from disk, but only once the editor is
+	 * showing that file's content, then bind.
+	 *
+	 * - "abandoned": the pane moved on, the path was tombstoned, or disk is unreadable.
+	 * - "retry": the editor still shows something else (normally the previous
+	 *   note mid-switch); try again shortly.
+	 * - "bound": an entry exists (seeded here or imported by reconcile) and bind() ran.
+	 */
+	private async seedFromDisk(
+		view: MarkdownView,
+		deviceName: string,
+		leafId: string,
+		path: string,
+		reason: string,
+	): Promise<"bound" | "retry" | "abandoned"> {
+		const stillShowing = () => view.file?.path === path;
+		if (!stillShowing()) return "abandoned";
+
+		if (!this.vaultSync.getTextForPath(path)) {
+			if (this.isHardTombstonedPath(path)) return "abandoned";
+			const file = view.file;
+			if (!file) return "abandoned";
+
+			let diskContent: string;
+			try {
+				diskContent = await view.app.vault.read(file);
+			} catch (err) {
+				this.log(`seedFromDisk: cannot read "${path}" (${String(err)})`);
+				return "abandoned";
 			}
-			return null;
+			if (!stillShowing()) return "abandoned";
+
+			// Reconcile's create handler may have imported the file meanwhile.
+			if (!this.vaultSync.getTextForPath(path)) {
+				const editorContent = view.editor.getValue();
+				const attempts = (this.diskSeedAttempts.get(leafId) ?? 0) + 1;
+				this.diskSeedAttempts.set(leafId, attempts);
+
+				let seedContent: string;
+				if (editorContent === diskContent) {
+					seedContent = diskContent;
+				} else if (attempts <= DISK_SEED_MAX_ATTEMPTS) {
+					this.log(
+						`seedFromDisk: editor not yet showing "${path}" ` +
+						`(editor=${editorContent.length}, disk=${diskContent.length} chars, attempt=${attempts})`,
+					);
+					return "retry";
+				} else {
+					// The editor has had the full settle budget to load this file, so
+					// a remaining difference is the user's own unsaved typing, which
+					// is the local authority (the pre-fix behaviour, minus the race).
+					this.trace?.("editor", "binding-seed-editor-authority", {
+						leafId, path, reason, attempts,
+						editorLength: editorContent.length,
+						diskLength: diskContent.length,
+					});
+					seedContent = editorContent;
+				}
+
+				const ytext = this.vaultSync.ensureFile(path, seedContent, deviceName);
+				if (!ytext) {
+					if (this.isHardTombstonedPath(path)) {
+						this.handleTombstonedBinding(view, `${reason}:ensureFile-null`);
+					} else {
+						this.log(`seedFromDisk: ensureFile returned null for "${path}" (reason=${reason})`);
+						this.trace?.("editor", "binding-target-missing", { path, reason, leafId });
+					}
+					return "abandoned";
+				}
+			}
 		}
 
-		return {
-			ytext,
-			fileId:
-				this.vaultSync.getFileId(file.path)
-				?? this.vaultSync.getFileIdForText(ytext),
-		};
+		if (!stillShowing()) return "abandoned";
+		this.bind(view, deviceName);
+		return "bound";
 	}
 
 	private isHardTombstonedPath(path: string): boolean {
