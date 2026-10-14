@@ -37,6 +37,10 @@ import type { CandidateStore, ScopeKey, ScopeMetadata } from "./candidateStore";
 import { PRODUCT_EVENT_KIND } from "../observability/productEventKinds";
 import type { ProductFlightPathEventInput } from "../observability/traceSink";
 import { TICKET_REFRESH_BUFFER_MS, patchTicketInUrl } from "./socketTicket";
+import {
+	TicketRejectionRecovery,
+	classifyTicketRefreshFailure,
+} from "./ticketRejectionRecovery";
 
 /** Current schema version. Stored in sys.schemaVersion. */
 export { SCHEMA_VERSION } from "./schema";
@@ -54,6 +58,9 @@ const PROVIDER_SYNC_TIMEOUT_MS = 10_000;
  * timing provides sufficient de-correlation.
  */
 const MAX_BACKOFF_TIME_MS = 30_000;
+/** Backoff for re-checking the token while the network or server is down. */
+const TICKET_RECOVERY_TRANSIENT_BASE_DELAY_MS = 2_000;
+const TICKET_RECOVERY_TRANSIENT_MAX_DELAY_MS = MAX_BACKOFF_TIME_MS;
 
 /** Debounce window for batching rename events (folder renames). */
 const RENAME_BATCH_MS = 50;
@@ -292,6 +299,13 @@ export class VaultSync {
 	/** Timer handle for the proactive provider URL ticket refresh. */
 	private _socketTicketRefreshTimer: number | null = null;
 
+	/** Decides whether an "unauthorized" socket rejection is a stale ticket. */
+	private readonly _ticketRejectionRecovery = new TicketRejectionRecovery();
+	/** Retry handle while the token check waits out a transient failure. */
+	private _ticketRecoveryRetryTimer: number | null = null;
+	private _ticketRecoveryTransientFailures = 0;
+	private _destroyed = false;
+
 
 	constructor(
 		settings: VaultSyncSettings,
@@ -454,19 +468,33 @@ export class VaultSync {
 			if (!msg) {
 				return;
 			}
-			const firstFatal = !this._fatalAuthError;
-			this._fatalAuthError = true;
-			this._fatalAuthCode = msg.code;
-			this._fatalAuthDetails = {
-				clientSchemaVersion: msg.clientSchemaVersion,
-				roomSchemaVersion: msg.roomSchemaVersion,
-				reason: msg.reason,
-			};
-			if (firstFatal) {
-				this.log(`Fatal auth error: ${msg.code} — stopping reconnection`);
+			if (this._fatalAuthError) {
+				// Already latched; the server sends each fatal frame twice.
+				this.provider.disconnect();
+				return;
 			}
-			this.provider.disconnect();
-			this.resolvePendingProviderSyncWaiters(false);
+			// An expired ticket and a wrong token both arrive as "unauthorized".
+			// Only latch once the HTTP ticket endpoint confirms the token itself
+			// is rejected. See ticketRejectionRecovery.ts.
+			const decision = this._ticketRejectionRecovery.onFatalFrame(
+				msg.code,
+				!!this._getSocketTicket && this.providerUrlCarriesTicket(),
+			);
+			if (decision === "in-flight") {
+				this.provider.disconnect();
+				return;
+			}
+			if (decision === "recover") {
+				this.log(
+					`Ticket rejected (attempt ${this._ticketRejectionRecovery.attemptCount}) — ` +
+					"verifying token before treating it as fatal",
+				);
+				// Stop y-partyserver's reconnect loop from replaying the rejected URL.
+				this.provider.disconnect();
+				void this.recoverFromTicketRejection();
+				return;
+			}
+			this.latchFatalAuth(msg);
 		};
 
 		// y-partyserver emits "__YPS:" control payloads via "custom-message".
@@ -487,6 +515,11 @@ export class VaultSync {
 			if (typeof event.data === "string") {
 				handleFatalAuthPayload(event.data);
 			}
+		});
+		// Only a real sync proves the server accepted us; "connected" fires on
+		// socket open, before the server's auth verdict arrives.
+		this.provider.on("sync", (synced: boolean) => {
+			if (synced) this._ticketRejectionRecovery.onSynced();
 		});
 		void this.provider.connect().catch((err: unknown) => {
 			this.log(`Provider connect failed: ${formatUnknown(err)}`);
@@ -2043,10 +2076,145 @@ export class VaultSync {
 		}
 	}
 
+	// -------------------------------------------------------------------
+	// Fatal auth and stale-ticket recovery
+	// -------------------------------------------------------------------
+
+	private latchFatalAuth(msg: FatalAuthMessage): void {
+		const firstFatal = !this._fatalAuthError;
+		this._fatalAuthError = true;
+		this._fatalAuthCode = msg.code;
+		this._fatalAuthDetails = {
+			clientSchemaVersion: msg.clientSchemaVersion,
+			roomSchemaVersion: msg.roomSchemaVersion,
+			reason: msg.reason,
+		};
+		if (firstFatal) {
+			this.log(`Fatal auth error: ${msg.code} — stopping reconnection`);
+		}
+		this.clearTicketRecoveryRetryTimer();
+		this.provider.disconnect();
+		this.resolvePendingProviderSyncWaiters(false);
+	}
+
+	private providerUrlCarriesTicket(): boolean {
+		try {
+			return new URL(this.provider.url).searchParams.has("ticket");
+		} catch {
+			return false;
+		}
+	}
+
+	/**
+	 * A ticket was rejected. Ask the HTTP ticket endpoint, which checks the
+	 * long-lived token itself, whether we are genuinely unauthorized.
+	 */
+	private async recoverFromTicketRejection(): Promise<void> {
+		this._ticketRecoveryRetryTimer = null;
+		if (this._destroyed || this._fatalAuthError || !this._getSocketTicket) {
+			this._ticketRejectionRecovery.settle();
+			return;
+		}
+		try {
+			const ticket = await this._getSocketTicket(true);
+			if (this._destroyed || this._fatalAuthError) return;
+			this._ticketRecoveryTransientFailures = 0;
+			if (ticket) {
+				this.patchProviderTicket(ticket.value);
+				this.scheduleSocketTicketRefresh(ticket);
+			}
+			this._ticketRejectionRecovery.settle();
+			this.log("Token accepted — the rejected ticket was stale; reconnecting with a fresh one");
+			// connect() re-runs params(), which reads the freshly cached ticket.
+			void this.provider.connect().catch((err: unknown) => {
+				this.log(`Provider reconnect after ticket recovery failed: ${formatUnknown(err)}`);
+			});
+		} catch (err) {
+			if (this._destroyed || this._fatalAuthError) return;
+			if (classifyTicketRefreshFailure(err) === "token-rejected") {
+				this._ticketRejectionRecovery.settle();
+				this.log(`Ticket endpoint rejected the token (${formatUnknown(err)})`);
+				this.latchFatalAuth({
+					code: "unauthorized",
+					clientSchemaVersion: null,
+					roomSchemaVersion: null,
+					reason: "token_rejected",
+				});
+				return;
+			}
+			// Offline or server hiccup: neither proves nor disproves the token.
+			// Stay "in flight" so stray frames cannot spend more budget, and retry.
+			this._ticketRecoveryTransientFailures += 1;
+			const delayMs = Math.min(
+				TICKET_RECOVERY_TRANSIENT_MAX_DELAY_MS,
+				TICKET_RECOVERY_TRANSIENT_BASE_DELAY_MS * 2 ** (this._ticketRecoveryTransientFailures - 1),
+			);
+			this.log(
+				`Token check failed transiently (${formatUnknown(err)}); retrying in ${delayMs}ms`,
+			);
+			this.clearTicketRecoveryRetryTimer();
+			this._ticketRecoveryRetryTimer = window.setTimeout(() => {
+				void this.recoverFromTicketRejection();
+			}, delayMs);
+		}
+	}
+
+	private clearTicketRecoveryRetryTimer(): void {
+		if (this._ticketRecoveryRetryTimer !== null) {
+			window.clearTimeout(this._ticketRecoveryRetryTimer);
+			this._ticketRecoveryRetryTimer = null;
+		}
+	}
+
+	/**
+	 * Explicit user retry ("Reconnect to sync server"). A fixed server or
+	 * token, or a stale latch from before this fix, should not need a plugin
+	 * reload. Schema mismatches stay latched: retrying cannot fix them.
+	 *
+	 * Returns false when the latch is kept.
+	 */
+	retryAfterFatalAuth(reason: string): boolean {
+		if (this._fatalAuthCode === "update_required") return false;
+		this.log(`Manual retry after fatal auth (${this._fatalAuthCode ?? "none"}): ${reason}`);
+		this._fatalAuthError = false;
+		this._fatalAuthCode = null;
+		this._fatalAuthDetails = null;
+		this._ticketRejectionRecovery.reset();
+		this._ticketRecoveryTransientFailures = 0;
+		this.clearTicketRecoveryRetryTimer();
+		this.provider.disconnect();
+		const reconnect = async () => {
+			if (this._getSocketTicket) {
+				// Never reuse the ticket that may have just been rejected.
+				const ticket = await this._getSocketTicket(true);
+				if (ticket) {
+					this.patchProviderTicket(ticket.value);
+					this.scheduleSocketTicketRefresh(ticket);
+				}
+			}
+			await this.provider.connect();
+		};
+		void reconnect().catch((err: unknown) => {
+			if (classifyTicketRefreshFailure(err) === "token-rejected") {
+				this.latchFatalAuth({
+					code: "unauthorized",
+					clientSchemaVersion: null,
+					roomSchemaVersion: null,
+					reason: "token_rejected",
+				});
+				return;
+			}
+			this.log(`Manual retry connect failed: ${formatUnknown(err)}`);
+		});
+		return true;
+	}
+
 	async destroy(): Promise<void> {
 		this.log("Destroying VaultSync");
+		this._destroyed = true;
 		if (this._renameTimer) window.clearTimeout(this._renameTimer);
 		this.clearSocketTicketRefreshTimer();
+		this.clearTicketRecoveryRetryTimer();
 		this.clearPendingRenames();
 		await this.flushReceiptPersistence();
 

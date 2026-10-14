@@ -91,12 +91,20 @@ export class ConnectionController {
 	reconnect(reason: string): void {
 		const sync = this.deps.getVaultSync();
 		if (!sync) return;
-		if (sync.fatalAuthError) {
-			this.deps.log(`Reconnect skipped (${reason}): fatal auth (${sync.fatalAuthCode ?? "unknown"})`);
-			return;
-		}
 		if (this.deps.isReconnectBlocked?.()) {
 			this.deps.log(`Reconnect blocked (${reason}): QA offline hold is active`);
+			return;
+		}
+		if (sync.fatalAuthError) {
+			// Only the explicit command reaches here (automatic paths check
+			// fatalAuthError themselves). A user asking to reconnect deserves a
+			// real attempt, not a silent no-op until the plugin is reloaded.
+			if (sync.retryAfterFatalAuth(reason)) {
+				this.deps.log(`Reconnect (${reason}): cleared fatal auth latch, retrying with a fresh ticket`);
+				this.deps.refreshStatusBar();
+			} else {
+				this.deps.log(`Reconnect skipped (${reason}): fatal auth (${sync.fatalAuthCode ?? "unknown"})`);
+			}
 			return;
 		}
 		sync.provider.disconnect();
