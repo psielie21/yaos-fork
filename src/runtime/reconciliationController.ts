@@ -54,6 +54,7 @@ import {
 	type AmplificationEntry,
 } from "./reconcile/amplificationQuarantinePolicy";
 import { evaluateConflictArtifactCap } from "./reconcile/conflictArtifactPolicy";
+import { isMarkdownConflictArtifactPath } from "../sync/markdownConflictArtifact";
 
 
 export interface ReconciliationStats {
@@ -688,6 +689,14 @@ export class ReconciliationController {
 				// correct input, not a flattened "defer-to-crdt-flush" for everything.
 				const updatesToFlush: Array<{ path: string; baselineActionKind: BaselineActionKind }> = [];
 				for (const path of result.createdOnDisk) {
+					// Conflict notes are local-only. A legacy synced entry is never
+					// "missing on disk": the disk scan skips that filename pattern,
+					// so writing it back resurrected every deleted conflict note on
+					// each startup. Leave it alone; deleting the file tombstones it.
+					if (isMarkdownConflictArtifactPath(path)) {
+						this.deps.log(`reconcile: not recreating legacy synced conflict note "${path}"`);
+						continue;
+					}
 					this.deps.recordFlightPathEvent?.({
 						priority: "important",
 						kind: PRODUCT_EVENT_KIND.reconcileFileDecision,

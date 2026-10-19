@@ -12,6 +12,7 @@ import {
 } from "./frontmatterGuard";
 import { isLocalOrigin } from "./origins";
 import { contentBaselineHash } from "./diskIndex";
+import { isMarkdownConflictArtifactPath } from "./markdownConflictArtifact";
 import { PreservedUnresolvedRegistry, type PreservedUnresolvedEntry, type PreservedUnresolvedReason } from "./preservedUnresolved";
 export { isLocalOrigin };
 
@@ -387,6 +388,12 @@ export class DiskMirror {
 
 	scheduleWrite(path: string): void {
 		path = normalizePath(path);
+		// Conflict notes are local-only. Never materialize a legacy synced
+		// entry from the CRDT (remote deletes still go through handleRemoteDelete).
+		if (isMarkdownConflictArtifactPath(path)) {
+			this.log(`scheduleWrite: skipped legacy synced conflict note "${path}"`);
+			return;
+		}
 		if (this.openPaths.has(path)) {
 			this.scheduleOpenWrite(path);
 			return;

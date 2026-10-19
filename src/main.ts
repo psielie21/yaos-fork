@@ -15,6 +15,7 @@ import {
 	type ServerCapabilities,
 } from "./sync/serverCapabilities";
 import { isMarkdownSyncable, isBlobSyncable } from "./types";
+import { isMarkdownConflictArtifactPath } from "./sync/markdownConflictArtifact";
 import { planCategoryRenameAction } from "./sync/policy/renameAdmissionPolicy";
 import { classifySyncPath } from "./paths/pathCategory";
 import { isCanonicalPathFileIdCollision } from "./paths/pathCollision";
@@ -1374,6 +1375,31 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						opId,
 					);
 					this.log(`Delete: "${file.path}"`);
+					} else if (
+						isMarkdownConflictArtifactPath(file.path)
+						&& this.vaultSync?.getTextForPath(file.path)
+					) {
+						// Legacy conflict note. Conflict notes are local-only now, but
+						// older versions synced them into the room. Their filename makes
+						// them non-syncable, so without this branch the delete never
+						// reached the CRDT and startup reconcile recreated the file.
+						// Tombstone the legacy entry so the delete sticks everywhere.
+						if (this.diskMirror?.consumeDeleteSuppression(file.path)) {
+							return;
+						}
+						const opId = this.newOpId();
+						this.traceSink.recordPath({
+							kind: "disk.delete.observed",
+							scope: "file",
+							severity: "info",
+							priority: "critical",
+							opId,
+							path: file.path,
+							data: { reason: "legacy-synced-conflict-artifact" },
+						});
+						this.editorWorkspace?.onMarkdownDeleted(file.path);
+						this.vaultSync.handleDelete(file.path, this.settings.deviceName, opId);
+						this.log(`Delete (legacy synced conflict note): "${file.path}"`);
 					} else {
 						const blobSync = this.getBlobSync();
 						if (blobSync && this.isBlobPathSyncable(file.path) && !blobSync.isSuppressed(file.path)) {
